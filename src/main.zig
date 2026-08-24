@@ -14,42 +14,48 @@ pub fn main(init: std.process.Init) !void {
     const gpa: Allocator = init.gpa;
     const io: Io = init.io;
 
-    // Dimensions of the output image in pixels
-    const dim: Vector(usize) = comptime .init(4000, 3000);
-
-    // Upper-left and lower-right corners of the complex plane viewport
-    const view_ul: Complex(f64) = .init(-1.20, 0.35);
-    const view_lr: Complex(f64) = .init(-1, 0.20);
+    // The view-plane of the mandelbrot subset we're rendering.
+    const view: Plane = .{
+        .dim = .init(4000, 3000),
+        .ul = .init(-1.20, 0.35),
+        .lr = .init(-1, 0.20),
+    };
 
     // Allocate buffer on the heap in case the dimensions make it too large for the stack
-    const render_buffer: []u8 = try gpa.alloc(u8, dim.x * dim.y);
+    const render_buffer: []u8 = try gpa.alloc(u8, view.size());
     defer gpa.free(render_buffer);
 
     // Split buffer into chunks for multithreaded rendering
     const thread_count: u8 = 8;
-    const chunk_rows: usize = dim.y / thread_count + 1;
-    const chunk_size: usize = dim.x * chunk_rows;
-    var chunks: [thread_count][]u8 = undefined;
+    var threads: [thread_count]Thread = undefined;
+
+    const chunk_lines: usize = view.dim.y / thread_count + 1;
+    const chunk_size: usize = view.dim.x * chunk_lines;
+
+    var buffer_chunks: [thread_count][]u8 = undefined;
     var chunk_iter: WindowIterator(u8) = window(u8, render_buffer, chunk_size, chunk_size);
-    for (&chunks) |*it| it.* = @constCast(chunk_iter.next().?);
+
+    for (&buffer_chunks) |*it| it.* = @constCast(chunk_iter.next().?);
 
     // Spawn threads to render each chunk of the image
-    var threads: [thread_count]Thread = undefined;
-    for (chunks, 0..) |chunk, i| {
-        const chunk_top: usize = chunk_rows * i;
-        const chunk_height: usize = chunk.len / dim.x;
-        const chunk_dim: Vector(usize) = .init(dim.x, chunk_height);
-        const chunk_ul: Complex(f64) = plot(.init(0, chunk_top), dim, view_ul, view_lr);
-        const chunk_lr: Complex(f64) = plot(.init(dim.x, chunk_top + chunk_height), dim, view_ul, view_lr);
+    for (buffer_chunks, 0..) |it, i| {
+        const chunk_top: usize = chunk_lines * i;
+        const chunk_height: usize = it.len / view.dim.x;
 
-        threads[i] = try .spawn(.{}, render, .{ chunks[i], chunk_dim, chunk_ul, chunk_lr });
+        const chunk_plane: Plane = .{
+            .dim = .init(view.dim.x, chunk_height),
+            .ul = view.plot(.init(0, chunk_top)),
+            .lr = view.plot(.init(view.dim.x, chunk_top + chunk_height)),
+        };
+
+        threads[i] = try .spawn(.{}, Plane.render, .{ chunk_plane, buffer_chunks[i] });
     }
 
     // Wait for threads to finish
     for (threads) |t| t.join();
 
     // Allocate image on the heap from the rendered buffer
-    var image: Image = try .fromRawPixels(gpa, dim.x, dim.y, render_buffer, .grayscale8);
+    var image: Image = try .fromRawPixels(gpa, view.dim.x, view.dim.y, render_buffer, .grayscale8);
     defer image.deinit(gpa);
 
     // Write image to file
@@ -76,67 +82,69 @@ fn Vector(comptime T: type) type {
     };
 }
 
+/// A subset of the cartesian plane of complex numbers, mapped to specific pixel
+/// dimensions.
+const Plane = struct {
+    /// The dimensions of this plane in pixels.
+    dim: Vector(usize),
+
+    /// The complex number defining the upper-left corner of the plane.
+    ul: Complex(f64),
+
+    /// The complex number defining the lower-right corner of the plane.
+    lr: Complex(f64),
+
+    /// Returns the buffer size needed for rendering this plane.
+    fn size(self: *const Plane) usize {
+        return self.dim.x * self.dim.y;
+    }
+
+    /// Plot the given `pixel` on the plane, translating its position from pixel
+    /// coordinates to a complex point.
+    ///
+    /// Returns the position of the given pixel on the complex plane.
+    fn plot(self: *const Plane, pixel: Vector(usize)) Complex(f64) {
+        const width, const height = .{
+            self.lr.re - self.ul.re,
+            self.ul.im - self.lr.im,
+        };
+
+        const bx, const by = self.dim.float();
+        const px, const py = pixel.float();
+
+        return .init(
+            self.ul.re + px * width / bx,
+            self.ul.im - py * height / by,
+        );
+    }
+
+    /// Write grayscale mandelbrot set data for this plane subset to the given `pixel_buffer`.
+    ///
+    /// Each pixel within the bounds of the dimensions of this `Plane` represents
+    /// a point on the cartesian plane of complex numbers and will be shaded according
+    /// to its presence in the mandelbrot set.
+    fn render(self: Plane, pixel_buffer: []u8) void {
+        assert(pixel_buffer.len == self.dim.x * self.dim.y);
+
+        for (0..self.dim.y) |row| {
+            for (0..self.dim.x) |col| {
+                const point: Complex(f64) = self.plot(.init(col, row));
+                const shade: u8 = if (mandel(point)) |t| 255 - t else 0;
+                pixel_buffer[row * self.dim.x + col] = shade;
+            }
+        }
+    }
+};
+
 /// Determine whether the given complex number `c` is in the mandelbrot set.
 ///
 /// Returns the number of iterations it took to determine `c` is not in the set,
 /// or `null` if `c` is assumed to be in the set.
-fn escapeTime(c: Complex(f64), limit: u8) ?u8 {
+fn mandel(c: Complex(f64)) ?u8 {
     var z: Complex(f64) = .init(0, 0);
 
-    return for (0..limit) |i| {
+    return for (0..255) |i| {
         z = z.mul(z).add(c);
         if (z.squaredMagnitude() > 4) break @intCast(i);
     } else null;
-}
-
-/// Map a given pixel to a point on the cartesian plane of complex numbers defined
-/// by the given `upper_left` and `lower_right` points of the plane.
-///
-/// The complex plane itself is bound to pixel dimensions specified by `bounds`.
-fn plot(
-    pixel: Vector(usize),
-    bounds: Vector(usize),
-    upper_left: Complex(f64),
-    lower_right: Complex(f64),
-) Complex(f64) {
-    const width, const height = .{
-        lower_right.re - upper_left.re,
-        upper_left.im - lower_right.im,
-    };
-
-    const bx, const by = bounds.float();
-    const px, const py = pixel.float();
-
-    return .init(
-        upper_left.re + px * width / bx,
-        upper_left.im - py * height / by,
-    );
-}
-
-test "plot" {
-    try std.testing.expectEqual(
-        plot(.init(25, 75), .init(100, 100), .init(-1, 1), .init(1, -1)),
-        Complex(f64).init(-0.5, -0.5),
-    );
-}
-
-/// Write grayscale mandelbrot set pixel data to the given `pixel_buffer`.
-///
-/// Each pixel represents a point on the cartesian plane of complex numbers and
-/// will be shaded according to its presence in the mandelbrot set.
-fn render(
-    pixel_buffer: []u8,
-    bounds: Vector(usize),
-    upper_left: Complex(f64),
-    lower_right: Complex(f64),
-) void {
-    assert(pixel_buffer.len == bounds.x * bounds.y);
-
-    for (0..bounds.y) |row| {
-        for (0..bounds.x) |col| {
-            const point: Complex(f64) = plot(.init(col, row), bounds, upper_left, lower_right);
-            const shade: u8 = if (escapeTime(point, 255)) |t| 255 - t else 0;
-            pixel_buffer[row * bounds.x + col] = shade;
-        }
-    }
 }
