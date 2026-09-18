@@ -1,11 +1,12 @@
 const std = @import("std");
-const assert = std.debug.assert;
-const window = std.mem.window;
 const Allocator = std.mem.Allocator;
 const Complex = std.math.complex.Complex;
+const Group = std.Io.Group;
 const Io = std.Io;
-const Thread = std.Thread;
 const WindowIterator = std.mem.WindowIterator;
+
+const assert = std.debug.assert;
+const window = std.mem.window;
 
 const img = @import("zigimg");
 const Image = img.Image;
@@ -25,34 +26,37 @@ pub fn main(init: std.process.Init) !void {
     const render_buffer: []u8 = try gpa.alloc(u8, view.size());
     defer gpa.free(render_buffer);
 
-    // Split buffer into chunks for multithreaded rendering
-    const thread_count: u8 = 8;
-    var threads: [thread_count]Thread = undefined;
+    // Split buffer into chunks for concurrent rendering
+    const count: u8 = 8;
+    const lines: usize = view.dim.y / count + 1;
+    const size: usize = view.dim.x * lines;
+    var chunks: WindowIterator(u8) = window(u8, render_buffer, size, size);
 
-    const chunk_lines: usize = view.dim.y / thread_count + 1;
-    const chunk_size: usize = view.dim.x * chunk_lines;
+    var tasks: Group = .init;
+    defer tasks.cancel(io);
 
-    var buffer_chunks: [thread_count][]u8 = undefined;
-    var chunk_iter: WindowIterator(u8) = window(u8, render_buffer, chunk_size, chunk_size);
-
-    for (&buffer_chunks) |*it| it.* = @constCast(chunk_iter.next().?);
-
-    // Spawn threads to render each chunk of the image
-    for (buffer_chunks, 0..) |it, i| {
-        const chunk_top: usize = chunk_lines * i;
-        const chunk_height: usize = it.len / view.dim.x;
+    // Spawn tasks to render each chunk of the image
+    var i: usize = 0;
+    while (chunks.next()) |chunk| : (i += 1) {
+        const top: usize = lines * i;
+        const height: usize = chunk.len / view.dim.x;
 
         const chunk_plane: Plane = .{
-            .dim = .init(view.dim.x, chunk_height),
-            .ul = view.plot(.init(0, chunk_top)),
-            .lr = view.plot(.init(view.dim.x, chunk_top + chunk_height)),
+            .dim = .init(view.dim.x, height),
+            .ul = view.plot(.init(0, top)),
+            .lr = view.plot(.init(view.dim.x, top + height)),
         };
 
-        threads[i] = try .spawn(.{}, Plane.render, .{ chunk_plane, buffer_chunks[i] });
+        // Notes:
+        // - Group.concurrent guarantees concurrency but errors on single-threaded targets
+        // - Group.async can fall back to synchronous-execution if concurrency is unavailable
+
+        // try tasks.concurrent(io, Plane.render, .{ chunk_plane, @constCast(it) });
+        tasks.async(io, Plane.render, .{ chunk_plane, @constCast(chunk) });
     }
 
-    // Wait for threads to finish
-    for (threads) |t| t.join();
+    // Wait for tasks to finish
+    try tasks.await(io);
 
     // Allocate image on the heap from the rendered buffer
     var image: Image = try .fromRawPixels(gpa, view.dim.x, view.dim.y, render_buffer, .grayscale8);
@@ -60,7 +64,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Write image to file
     var write_buffer: [4096]u8 = undefined;
-    try image.writeToFilePath(gpa, io, "mandel.png", write_buffer[0..], .{ .png = .{} });
+    try image.writeToFilePath(gpa, io, "mandel.png", &write_buffer, .{ .png = .{} });
 }
 
 /// Represents a point in 2-dimensional space.
